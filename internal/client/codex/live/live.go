@@ -11,6 +11,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -26,9 +27,10 @@ import (
 )
 
 const (
-	upstreamCallURL  = "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
-	defaultLiveModel = "gpt-live-1-codex"
-	maxBodySize      = 16 << 20
+	upstreamCallURL   = "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+	defaultLiveModel  = "gpt-live-1-codex"
+	upstreamLiveModel = "gpt-live-1-boulder-alpha"
+	maxBodySize       = 16 << 20
 )
 
 var liveProtocolHeaders = []string{
@@ -264,6 +266,19 @@ func (h *Handler) Handle(c *gin.Context) {
 	}
 
 	headers := protocolHeaders(c.Request.Header)
+	if headers.Get("X-Oai-Attestation") == "" {
+		attestation, errAttestation := configuredLiveAttestation(runtimeConfig)
+		if errAttestation != nil {
+			if selection != nil {
+				selection.End("attestation_unavailable")
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errAttestation.Error()})
+			return
+		}
+		if attestation != "" {
+			headers.Set("X-Oai-Attestation", attestation)
+		}
+	}
 	headers.Set("Content-Type", upstreamContentType)
 	setAccountHeader(headers, selected)
 	req, errRequest := h.authManager.NewHttpRequest(ctx, selected, http.MethodPost, upstreamCallURL, upstreamBody, headers)
@@ -413,6 +428,33 @@ func (h *Handler) Handle(c *gin.Context) {
 	}
 }
 
+func configuredLiveAttestation(cfg *config.Config) (string, error) {
+	if cfg == nil {
+		return "", nil
+	}
+	path := strings.TrimSpace(cfg.Codex.LiveAttestationFile)
+	if path == "" {
+		return "", nil
+	}
+	payload, errRead := os.ReadFile(filepath.Clean(path))
+	if errRead != nil {
+		return "", fmt.Errorf("Codex live attestation is unavailable: %w", errRead)
+	}
+	if len(payload) > 64<<10 {
+		return "", errors.New("Codex live attestation exceeds 64 KiB")
+	}
+	value := strings.TrimSpace(string(payload))
+	var envelope struct {
+		Version int    `json:"v"`
+		Token   string `json:"t"`
+	}
+	if errDecode := json.Unmarshal([]byte(value), &envelope); errDecode != nil ||
+		envelope.Version != 1 || !strings.HasPrefix(envelope.Token, "v1.") {
+		return "", errors.New("Codex live attestation file is invalid")
+	}
+	return value, nil
+}
+
 func mediaCredentialName(selected *auth.Auth, authIndex string) string {
 	if selected == nil {
 		return strings.TrimSpace(authIndex)
@@ -482,10 +524,14 @@ func prepareCallRequest(body []byte, contentType string) ([]byte, string, string
 	if model == "" {
 		model = defaultLiveModel
 	}
+	upstreamBody, errNormalize := normalizeLiveRequest(body)
+	if errNormalize != nil {
+		return nil, "", "", errNormalize
+	}
 	if strings.TrimSpace(contentType) == "" {
 		contentType = "application/json"
 	}
-	return body, contentType, model, nil
+	return upstreamBody, contentType, model, nil
 }
 
 func multipartCallRequest(body []byte, boundary string) ([]byte, string, string, error) {
@@ -532,12 +578,72 @@ func multipartCallRequest(body []byte, boundary string) ([]byte, string, string,
 	if model == "" {
 		model = defaultLiveModel
 	}
+	session, errNormalize := normalizeLiveSession(session)
+	if errNormalize != nil {
+		return nil, "", "", errNormalize
+	}
 
 	encoded, errEncode := encodeCallRequest(*sdp, session)
 	if errEncode != nil {
 		return nil, "", "", errEncode
 	}
 	return encoded, "application/json", model, nil
+}
+
+// normalizeLiveRequest preserves the public gpt-live-1-codex alias while
+// translating its session to the current frameless AVAS contract used by
+// Codex Desktop. Explicit upstream model names and unrelated payloads pass
+// through unchanged.
+func normalizeLiveRequest(body []byte) ([]byte, error) {
+	var payload map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return body, nil
+	}
+	session, ok := payload["session"]
+	if !ok {
+		return body, nil
+	}
+	normalized, errNormalize := normalizeLiveSession(session)
+	if errNormalize != nil {
+		return nil, errNormalize
+	}
+	payload["session"] = normalized
+	encoded, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("failed to encode Codex live request: %w", errMarshal)
+	}
+	return encoded, nil
+}
+
+func normalizeLiveSession(session json.RawMessage) (json.RawMessage, error) {
+	if len(session) == 0 {
+		return session, nil
+	}
+	var value map[string]any
+	if errUnmarshal := json.Unmarshal(session, &value); errUnmarshal != nil {
+		return nil, errors.New("Codex live session field must contain a JSON object")
+	}
+	model, _ := value["model"].(string)
+	if strings.TrimSpace(model) != defaultLiveModel {
+		return session, nil
+	}
+	value["model"] = upstreamLiveModel
+	if _, ok := value["instructions"]; !ok {
+		value["instructions"] = ""
+	}
+	if _, ok := value["audio"]; !ok {
+		value["audio"] = map[string]any{
+			"output": map[string]any{"voice": "cove"},
+		}
+	}
+	if _, ok := value["delegation"]; !ok {
+		value["delegation"] = map[string]any{"type": "client"}
+	}
+	encoded, errMarshal := json.Marshal(value)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("failed to encode Codex live session: %w", errMarshal)
+	}
+	return encoded, nil
 }
 
 func encodeCallRequest(sdp string, session json.RawMessage) ([]byte, error) {

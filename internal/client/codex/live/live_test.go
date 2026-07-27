@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -279,7 +281,7 @@ func TestHandlerRewritesLiveCallAndSchedulesOAuth(t *testing.T) {
 	if upstreamPayload.SDP != "v=0\r\na=setup:actpass" {
 		t.Fatalf("upstream sdp = %q", upstreamPayload.SDP)
 	}
-	if got := upstreamPayload.Session["model"]; got != "gpt-live-1-codex" {
+	if got := upstreamPayload.Session["model"]; got != upstreamLiveModel {
 		t.Fatalf("upstream session model = %#v", got)
 	}
 	if got := executor.request.Header.Get("Content-Type"); got != "application/json" {
@@ -793,6 +795,54 @@ func TestPrepareCallRequestRewritesMultipart(t *testing.T) {
 	}
 }
 
+func TestPrepareCallRequestMapsPublicAliasToCurrentFramelessSession(t *testing.T) {
+	body := []byte(`{"sdp":"v=0-offer","session":{"model":"gpt-live-1-codex","instructions":"hi"}}`)
+
+	encoded, contentType, model, errPrepare := prepareCallRequest(body, "application/json")
+	if errPrepare != nil {
+		t.Fatalf("prepareCallRequest() error = %v", errPrepare)
+	}
+	if contentType != "application/json" {
+		t.Fatalf("content type = %q, want application/json", contentType)
+	}
+	if model != defaultLiveModel {
+		t.Fatalf("selection model = %q, want public alias %q", model, defaultLiveModel)
+	}
+	var payload struct {
+		Session map[string]any `json:"session"`
+	}
+	if errUnmarshal := json.Unmarshal(encoded, &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal normalized body: %v", errUnmarshal)
+	}
+	if payload.Session["model"] != upstreamLiveModel {
+		t.Fatalf("upstream model = %q, want %q", payload.Session["model"], upstreamLiveModel)
+	}
+	audio, _ := payload.Session["audio"].(map[string]any)
+	output, _ := audio["output"].(map[string]any)
+	if output["voice"] != "cove" {
+		t.Fatalf("upstream voice = %q, want cove", output["voice"])
+	}
+	delegation, _ := payload.Session["delegation"].(map[string]any)
+	if delegation["type"] != "client" {
+		t.Fatalf("delegation type = %q, want client", delegation["type"])
+	}
+}
+
+func TestPrepareCallRequestPreservesExplicitUpstreamSession(t *testing.T) {
+	body := []byte(`{"sdp":"v=0-offer","session":{"model":"future-live-model","custom":true}}`)
+
+	encoded, _, model, errPrepare := prepareCallRequest(body, "application/json")
+	if errPrepare != nil {
+		t.Fatalf("prepareCallRequest() error = %v", errPrepare)
+	}
+	if model != "future-live-model" {
+		t.Fatalf("selection model = %q, want future-live-model", model)
+	}
+	if string(encoded) == "" || modelFromJSON(encoded) != "future-live-model" {
+		t.Fatalf("explicit upstream session was changed: %s", encoded)
+	}
+}
+
 func TestPrepareCallRequestPreservesRawSDPWhenRelayDisabled(t *testing.T) {
 	body := []byte("v=0\r\no=raw-offer\r\n")
 	prepared, contentType, model, errPrepare := prepareCallRequest(body, "application/sdp")
@@ -908,6 +958,34 @@ func TestHeadersForLoggingRedactsAttestation(t *testing.T) {
 	}
 	if value := source.Get("X-Oai-Attestation"); value != "attestation-token" {
 		t.Fatalf("source X-Oai-Attestation changed to %q", value)
+	}
+}
+
+func TestConfiguredLiveAttestationLoadsValidatedEnvelope(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "attestation")
+	if errWrite := os.WriteFile(path, []byte("{\"v\":1,\"s\":0,\"t\":\"v1.proof\"}\n"), 0o600); errWrite != nil {
+		t.Fatalf("write attestation: %v", errWrite)
+	}
+	cfg := &config.Config{Codex: config.CodexConfig{LiveAttestationFile: path}}
+
+	got, errLoad := configuredLiveAttestation(cfg)
+	if errLoad != nil {
+		t.Fatalf("configuredLiveAttestation() error = %v", errLoad)
+	}
+	if got != `{"v":1,"s":0,"t":"v1.proof"}` {
+		t.Fatalf("attestation = %q", got)
+	}
+}
+
+func TestConfiguredLiveAttestationRejectsInvalidEnvelope(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "attestation")
+	if errWrite := os.WriteFile(path, []byte(`{"v":1,"t":"invalid"}`), 0o600); errWrite != nil {
+		t.Fatalf("write attestation: %v", errWrite)
+	}
+	cfg := &config.Config{Codex: config.CodexConfig{LiveAttestationFile: path}}
+
+	if _, errLoad := configuredLiveAttestation(cfg); errLoad == nil {
+		t.Fatal("configuredLiveAttestation() accepted an invalid envelope")
 	}
 }
 
